@@ -43,9 +43,9 @@ env:
   WRT_THEME: ${{inputs.WRT_THEME}}
   WRT_NAME: ${{inputs.WRT_NAME}}
   WRT_SSID: ${{inputs.WRT_SSID}}
-  WRT_NETPW: ${{inputs.WRT_WORD}}
+  WRT_NETPW: ${{inputs.WRT_NETPW}}
   WRT_IP: ${{inputs.WRT_IP}}
-  WRT_USRPW: ${{inputs.WRT_PW}}
+  WRT_USRPW: ${{inputs.WRT_USRPW}}
   WRT_REPO: ${{inputs.WRT_REPO}}
   WRT_BRANCH: ${{inputs.WRT_BRANCH}}
   WRT_PACKAGE: ${{inputs.WRT_PACKAGE}}
@@ -141,8 +141,6 @@ jobs:
       - name: Update Feeds
         run: |
           cd ./wrt/
-
-          echo "src-git nss_packages https://github.com/qosmio/nss-packages.git" >> feeds.conf.default
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a

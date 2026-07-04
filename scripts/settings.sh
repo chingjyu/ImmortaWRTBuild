@@ -13,16 +13,12 @@ if [ -f "$WIFI_SH" ]; then
 	# modify SSID
 	sed -i "s/BASE_SSID='.*'/BASE_SSID='$WRT_SSID'/g" $WIFI_SH
 	# modify WiFi Password
-	sed -i "s/BASE_WORD='.*'/BASE_WORD='$WRT_NETPD'/g" $WIFI_SH
+	sed -i "s/BASE_WORD='.*'/BASE_WORD='$WRT_NETPW'/g" $WIFI_SH
 elif [ -f "$WIFI_UC" ]; then
 	# modify SSID
 	sed -i "s/ssid='.*'/ssid='$WRT_SSID'/g" $WIFI_UC
 	# modify WiFi Password
-	sed -i "s/key='.*'/key='$WRT_NETPD'/g" $WIFI_UC
-	# modify WiFi Region
-	sed -i "s/country='.*'/country='CN'/g" $WIFI_UC
-	# modify WiFi Encryption
-	sed -i "s/encryption='.*'/encryption='psk2+ccmp'/g" $WIFI_UC
+	sed -i "s/key='.*'/key='$WRT_NETPW'/g" $WIFI_UC
 fi
 
 CFG_FILE="./package/base-files/files/bin/config_generate"
@@ -42,27 +38,4 @@ if [ -n "$WRT_PACKAGE" ]; then
 fi
 
 # adjustments for quancomm devices
-DTS_PATH="./target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/"
-if [[ "${WRT_TARGET^^}" == *"QUALCOMMAX"* ]]; then
-	# disable nss-related feed
-	# echo "CONFIG_FEED_nss_packages=n" >> ./.config
-	echo "CONFIG_FEED_sqm_scripts_nss=n" >> ./.config
-	# disable sqm-nss packages
-	echo "CONFIG_PACKAGE_luci-app-sqm=n" >> ./.config
-	echo "CONFIG_PACKAGE_sqm-scripts-nss=n" >> ./.config
-	# set NSS version
-	echo "CONFIG_NSS_FIRMWARE_VERSION_11_4=n" >> ./.config
-	if [[ "${WRT_CONFIG,,}" == *"ipq50"* ]]; then
-		echo "CONFIG_NSS_FIRMWARE_VERSION_12_2=y" >> ./.config
-	else
-		echo "CONFIG_NSS_FIRMWARE_VERSION_12_5=y" >> ./.config
-	fi
-	# USB
-	echo "CONFIG_PACKAGE_kmod-usb-serial-qualcomm=y" >> ./.config
-fi
-
-#编译器优化
-if [[ $WRT_TARGET != *"X86"* ]]; then
-	echo "CONFIG_TARGET_OPTIONS=y" >> ./.config
-	echo "CONFIG_TARGET_OPTIMIZATION=\"-O2 -pipe -march=armv8-a+crypto+crc -mcpu=cortex-a53+crypto+crc -mtune=cortex-a53\"" >> ./.config
-fi
+DTS_PATH="./target/linux/qualcommax/dts/"

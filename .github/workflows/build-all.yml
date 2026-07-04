@@ -21,9 +21,19 @@ jobs:
       fail-fast: false
       #max-parallel: 3
       matrix:
-        CONFIG: [IPQ60XX-WIFI, IPQ807X-WIFI, MEDIATEK, X86]
-        SOURCE: [immortalwrt/immortalwrt]
-        BRANCH: [master]
+        include:
+          - CONFIG: IPQ60XX-WIFI
+            SOURCE: VIKINGYFY/immortalwrt
+            BRANCH: main
+          - CONFIG: IPQ807X-WIFI
+            SOURCE: VIKINGYFY/immortalwrt
+            BRANCH: main
+          - CONFIG: MEDIATEK
+            SOURCE: immortalwrt/immortalwrt
+            BRANCH: master
+          - CONFIG: X86
+            SOURCE: immortalwrt/immortalwrt
+            BRANCH: master
 
     uses: ./.github/workflows/build-core.yml
     with:
