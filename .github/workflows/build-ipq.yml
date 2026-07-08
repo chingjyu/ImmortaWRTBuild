@@ -1,0 +1,286 @@
+name: Build IPQ
+
+# Source-compiled targets on the VIKINGYFY fork (device support + 6.18 kernel
+# only exist there; the official ImageBuilder cannot produce these). Official
+# master targets (MEDIATEK, X86) are built compile-free in build-ib.yml.
+
+on:
+  workflow_run:
+    workflows: ["Auto Clean"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      PACKAGE:
+        description: 'Add packages manually, seperate by \n'
+        required: false
+        type: string
+
+permissions: write-all
+
+env:
+  GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+jobs:
+  build:
+    name: ${{matrix.CONFIG}}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      #max-parallel: 3
+      matrix:
+        include:
+          - CONFIG: IPQ60XX-WIFI
+            SOURCE: VIKINGYFY/immortalwrt
+            BRANCH: main
+          - CONFIG: IPQ807X-WIFI
+            SOURCE: VIKINGYFY/immortalwrt
+            BRANCH: main
+    env:
+      WRT_CONFIG: ${{matrix.CONFIG}}
+      WRT_THEME: bootstrap
+      WRT_NAME: ImmortalWRT
+      WRT_SSID: ImmortalWRT
+      WRT_NETPW: 12345678
+      WRT_IP: 192.168.1.1
+      WRT_USRPW: (empty)
+      WRT_REPO: https://github.com/${{matrix.SOURCE}}.git
+      WRT_BRANCH: ${{matrix.BRANCH}}
+      WRT_SOURCE: ${{matrix.SOURCE}}
+      WRT_PACKAGE: ${{inputs.PACKAGE}}
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@main
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq purge firefox
+          sudo -E apt -yqq update
+          sudo -E apt -yqq full-upgrade
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo -E apt -yqq install dos2unix libfuse-dev
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Hong_Kong"
+
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown $USER:$USER /mnt/build_wrt
+          sudo ln -s /mnt/build_wrt $GITHUB_WORKSPACE/wrt
+
+      - name: Initialization Values
+        run: |
+          echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")" >> $GITHUB_ENV
+          echo "WRT_MARK=$(echo $GITHUB_REPOSITORY | cut -d '/' -f 1)" >> $GITHUB_ENV
+          echo "WRT_VER=$(echo $WRT_REPO | cut -d '/' -f 5-)-$WRT_BRANCH" >> $GITHUB_ENV
+          echo "WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./config/$WRT_CONFIG.txt | tr '[:lower:]' '[:upper:]')" >> $GITHUB_ENV
+          echo "WRT_KVER=none" >> $GITHUB_ENV
+          echo "WRT_LIST=none" >> $GITHUB_ENV
+
+      - name: Clone Code
+        run: |
+          git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/
+
+          cd ./wrt/ && echo "WRT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+
+          # disable China Mainland mirrors
+          PROJECT_MIRRORS_FILE="./scripts/projectsmirrors.json"
+          if [ -f "$PROJECT_MIRRORS_FILE" ]; then
+            sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
+          fi
+
+          # Upstream 51f98136 removed MAC nvmem labels still referenced by both
+          # GL.iNet DTS files. Device config alone does not skip DTB compilation.
+          if [ "$WRT_CONFIG" = "IPQ60XX-WIFI" ]; then
+            IPQ60XX_IMAGE_MK="./target/linux/qualcommax/image/ipq60xx.mk"
+            sed -i -E '/^TARGET_DEVICES \+= glinet_gl-(ax1800|axt1800)$/d' "$IPQ60XX_IMAGE_MK"
+
+            if grep -Eq '^TARGET_DEVICES \+= glinet_gl-(ax1800|axt1800)$' "$IPQ60XX_IMAGE_MK"; then
+              echo "Failed to exclude broken GL.iNet IPQ60XX profiles" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Check Scripts
+        run: |
+          find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
+
+      - name: Check Caches
+        id: check-cache
+        if: env.WRT_TEST != 'true'
+        uses: actions/cache@main
+        with:
+          key: ${{env.WRT_CONFIG}}-${{env.WRT_VER}}-${{env.WRT_HASH}}
+          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_VER}}
+          path: |
+            ./wrt/.ccache
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
+
+      - name: Update Caches
+        if: env.WRT_TEST != 'true'
+        run: |
+          if [ -d "./wrt/staging_dir" ]; then
+            find "./wrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
+              find "$DIR" -type f -exec touch {} +
+            done
+
+            mkdir -p ./wrt/tmp && echo "1" > ./wrt/tmp/.build
+
+            echo "toolchain skiped done!"
+          else
+            echo "caches missed!"
+          fi
+
+          if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
+            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_VER" | cut -f 1)
+            for CACHE_KEY in $CACHE_LIST; do
+              gh cache delete $CACHE_KEY
+            done
+
+            echo "caches cleanup done!"
+          fi
+
+      - name: Update Feeds
+        run: |
+          cd ./wrt/
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Custom Settings
+        run: |
+          cd ./wrt/
+
+          cat $GITHUB_WORKSPACE/config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/config/GENERAL.txt >> .config
+
+          # extra packages from the dispatch input (append to .config)
+          [ -n "$WRT_PACKAGE" ] && echo -e "$WRT_PACKAGE" >> .config
+
+          make defconfig -j$(nproc) && make clean -j$(nproc)
+
+      - name: Custom Files
+        run: |
+          cd ./wrt/
+          ARCH=$(grep -oP 'CONFIG_TARGET_ARCH_PACKAGES="\K[^"]+' .config)
+
+          mkdir -p files/etc/uci-defaults files/etc/apk/keys files/etc/apk/repositories.d files/etc/prebuilt
+
+          # --- first-boot settings (replaces settings.sh sed-on-source) ---
+          cat > files/etc/uci-defaults/99-custom-settings <<EOF
+          #!/bin/sh
+          uci -q batch <<-UCI
+            set system.@system[0].hostname='$WRT_NAME'
+            set network.lan.ipaddr='$WRT_IP'
+          UCI
+          for dev in \$(uci -q show wireless | grep -oE 'wireless\.[^.]+=wifi-iface' | cut -d. -f2 | cut -d= -f1); do
+            uci -q set wireless.\$dev.ssid='$WRT_SSID'
+            uci -q set wireless.\$dev.key='$WRT_NETPW'
+            uci -q set wireless.\$dev.encryption='psk2'
+          done
+          uci -q commit
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-custom-settings
+
+          # --- custom apk feeds (config/CUSTOM-FEEDS.txt) ---
+          # For each feed: (1) bake it into the firmware for on-device `apk update`,
+          # and (2) preload its apks so they install offline on first boot -- source
+          # builds can't pull external prebuilt apks into the ROM, so we ship them on
+          # the device and install locally. Package filenames come from the feed's
+          # index.json (the momo GitHub tarball is unreliable: a53-SNAPSHOT is absent).
+          CUSTOM="$GITHUB_WORKSPACE/config/CUSTOM-FEEDS.txt"
+          if [ -f "$CUSTOM" ]; then
+            grep -vE '^\s*(#|$)' "$CUSTOM" | while IFS='|' read -r NAME URL PUBKEY; do
+              URL=$(echo "$URL" | sed "s/{arch}/$ARCH/g")
+              PUBKEY=$(echo "$PUBKEY" | sed "s/{arch}/$ARCH/g")
+              [ -n "$PUBKEY" ] && wget -qO "files/etc/apk/keys/$NAME.pem" "$PUBKEY"
+              echo "$URL/packages.adb" >> files/etc/apk/repositories.d/customfeeds.list
+              for APK in $(curl -sL "$URL/index.json" | python3 -c "import json,sys; print('\n'.join(f'{n}-{v}.apk' for n,v in json.load(sys.stdin)['packages'].items()))"); do
+                wget -qO "files/etc/prebuilt/$APK" "$URL/$APK" && echo "preloaded: $NAME/$APK"
+              done
+            done
+          fi
+
+          # --- sing-box: SagerNet prebuilt apk (latest release, arch-matched) ---
+          SB_VER=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+')
+          wget -qO "files/etc/prebuilt/sing-box_${SB_VER}_${ARCH}.apk" \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box_${SB_VER}_openwrt_${ARCH}.apk"
+
+          cat > files/etc/uci-defaults/98-install-prebuilt <<'EOF'
+          #!/bin/sh
+          [ -d /etc/prebuilt ] || exit 0
+          set -- /etc/prebuilt/*.apk
+          [ -e "$1" ] || { rm -rf /etc/prebuilt; exit 0; }
+          if apk add --allow-untrusted "$@"; then
+            rm -rf /etc/prebuilt
+            exit 0
+          fi
+          exit 1
+          EOF
+          chmod +x files/etc/uci-defaults/98-install-prebuilt
+          echo "prebuilt apks + feeds staged"
+
+      - name: Download Packages
+        if: env.WRT_TEST != 'true'
+        run: |
+          cd ./wrt/
+
+          make download -j$(nproc)
+
+      - name: Compile Firmware
+        if: env.WRT_TEST != 'true'
+        run: |
+          cd ./wrt/
+
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Machine Information
+        run: |
+          cd ./wrt/
+
+          echo "======================="
+          lscpu | grep -E "name|Core|Thread"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h --max-depth=1
+          echo "======================="
+
+      - name: Package Firmware
+        run: |
+          cd ./wrt/ && mkdir ./upload/
+
+          cp -f ./.config ./upload/config_"$WRT_CONFIG"_"$WRT_VER"_"$WRT_DATE".txt
+
+          if [[ $WRT_TEST != 'true' ]]; then
+            echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \;)" >> $GITHUB_ENV
+            echo "WRT_LIST=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^luci-(app|theme)[^ ]*' {} \; | tr '\n' ' ')" >> $GITHUB_ENV
+
+            find ./bin/targets/ -iregex ".*\(buildinfo\|json\|sha256sums\|packages\)$" -exec rm -rf {} +
+
+            for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
+              EXT=$(basename $FILE | cut -d '.' -f 2-)
+              NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
+              NEW_FILE="$WRT_VER"_"$NAME"_"$WRT_DATE"."$EXT"
+              mv -f $FILE ./upload/$NEW_FILE
+            done
+
+            find ./bin/targets/ -type f -exec mv -f {} ./upload/ \;
+
+            make clean -j$(nproc)
+          fi
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{env.WRT_CONFIG}}
+          files: ./wrt/upload/*.*
+          body: |
+            Platform: ${{env.WRT_CONFIG}} (${{env.WRT_TARGET}})
+            Kernel Version: ${{env.WRT_KVER}}

@@ -1,0 +1,231 @@
+name: Build ImageBuilder
+
+# Fast, compile-free builds for targets whose source is the official
+# immortalwrt master (MEDIATEK filogic, X86). Uses the official snapshot
+# ImageBuilder; third-party packages (momo) come from an online apk feed.
+# Source-built targets (IPQ, on the VIKINGYFY fork) live in build-ipq.yml.
+
+on:
+  workflow_run:
+    workflows: ["Auto Clean"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      PACKAGE:
+        description: 'Add packages manually, seperate by \n'
+        required: false
+        type: string
+
+permissions: write-all
+
+env:
+  GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+  WRT_NAME: ImmortalWRT
+  WRT_SSID: ImmortalWRT
+  WRT_NETPW: 12345678
+  WRT_IP: 192.168.1.1
+  WRT_THEME: bootstrap
+  WRT_PACKAGE: ${{inputs.PACKAGE}}
+  # Packages present in GENERAL/<TARGET> config but absent from the official
+  # apk feed (they only exist in the buildroot source tree). Skipped for IB.
+  IB_IGNORE: "cpufreq nand-utils kmod-mtd-rw"
+
+jobs:
+  imagebuilder:
+    name: ${{matrix.CONFIG}}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - CONFIG: MEDIATEK
+            TARGET: mediatek/filogic
+            ARCH: aarch64_cortex-a53
+          - CONFIG: X86_64
+            TARGET: x86/64
+            ARCH: x86_64
+    env:
+      WRT_CONFIG: ${{matrix.CONFIG}}
+      WRT_TARGET: ${{matrix.TARGET}}
+      WRT_ARCH: ${{matrix.ARCH}}
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@main
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq update
+          sudo -E apt -yqq install build-essential libncurses5-dev zlib1g-dev gawk \
+            git gettext libssl-dev xsltproc rsync wget unzip zstd dos2unix jq \
+            qemu-utils genisoimage
+          # x86 image gen calls `mkisofs`; genisoimage is the drop-in provider
+          command -v mkisofs >/dev/null || sudo ln -sf "$(command -v genisoimage)" /usr/local/bin/mkisofs
+          sudo -E timedatectl set-timezone "Asia/Hong_Kong"
+
+      - name: Initialization Values
+        run: |
+          echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")" >> $GITHUB_ENV
+          echo "WRT_MARK=$(echo $GITHUB_REPOSITORY | cut -d '/' -f 1)" >> $GITHUB_ENV
+          echo "IB_URL=https://downloads.immortalwrt.org/snapshots/targets/$WRT_TARGET" >> $GITHUB_ENV
+
+      - name: Download ImageBuilder
+        run: |
+          IB_FILE=$(wget -qO- "$IB_URL/" | grep -oP 'immortalwrt-imagebuilder[^"]+\.tar\.zst' | head -n1)
+          echo "downloading $IB_FILE"
+          wget -q "$IB_URL/$IB_FILE" -O ib.tar.zst
+          tar --zstd -xf ib.tar.zst
+          mv immortalwrt-imagebuilder-* ib
+          echo "ImageBuilder ready"
+
+      - name: Add Custom Feeds
+        run: |
+          cd ib
+          mkdir -p files/etc/apk/keys files/etc/apk/repositories.d
+
+          # config/CUSTOM-FEEDS.txt entries are used two ways:
+          #   1. added to ./repositories so ImageBuilder installs them into the
+          #      image at build time (ImageBuilder reads ./repositories, not .conf)
+          #   2. baked into the firmware so on-device `apk update` sees them
+          CUSTOM="$GITHUB_WORKSPACE/config/CUSTOM-FEEDS.txt"
+          if [ -f "$CUSTOM" ]; then
+            grep -vE '^\s*(#|$)' "$CUSTOM" | while IFS='|' read -r NAME URL PUBKEY; do
+              URL=$(echo "$URL" | sed "s/{arch}/$WRT_ARCH/g")
+              PUBKEY=$(echo "$PUBKEY" | sed "s/{arch}/$WRT_ARCH/g")
+              if [ -n "$PUBKEY" ]; then
+                wget -qO "keys/$NAME.pem" "$PUBKEY" || echo "warn: $NAME key fetch failed"
+                cp -f "keys/$NAME.pem" "files/etc/apk/keys/$NAME.pem"
+              fi
+              echo "$URL/packages.adb" >> ./repositories
+              echo "$URL/packages.adb" >> files/etc/apk/repositories.d/customfeeds.list
+              echo "feed added: $NAME -> $URL"
+            done
+          fi
+
+      - name: Add Prebuilt Packages
+        run: |
+          cd ib
+          # sing-box: SagerNet ships prebuilt OpenWrt apks (no packages.adb feed),
+          # so drop the arch-matched latest apk into the local packages/ feed and
+          # let `make package_index` index it for install into the image.
+          SB_VER=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+')
+          wget -qO /tmp/sing-box.apk \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box_${SB_VER}_openwrt_${WRT_ARCH}.apk"
+          SB_NAME=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*name:\s*\K\S+')
+          SB_PKGVER=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*version:\s*\K\S+')
+          mv /tmp/sing-box.apk "packages/${SB_NAME}-${SB_PKGVER}.apk"
+          make package_index
+          echo "added to local feed: ${SB_NAME}-${SB_PKGVER}.apk"
+
+      - name: Compute Package List
+        run: |
+          CFG="$GITHUB_WORKSPACE/config"
+
+          # base: =y packages from GENERAL + this target's config
+          grep -hoP '^CONFIG_PACKAGE_\K[^=]+(?==y)' "$CFG/GENERAL.txt" "$CFG/$WRT_CONFIG.txt" 2>/dev/null | sort -u > /tmp/pkgs.txt
+
+          # remove =n packages
+          grep -hoP '^CONFIG_PACKAGE_\K[^=]+(?==n)' "$CFG/GENERAL.txt" "$CFG/$WRT_CONFIG.txt" 2>/dev/null | sort -u > /tmp/pkgs_no.txt
+          comm -23 /tmp/pkgs.txt /tmp/pkgs_no.txt > /tmp/pkgs2.txt && mv /tmp/pkgs2.txt /tmp/pkgs.txt
+
+          # remove IB_IGNORE (source-only packages absent from the apk feed,
+          # plus any package you want dropped from IB images specifically)
+          for P in $IB_IGNORE; do sed -i "\|^$P$|d" /tmp/pkgs.txt; done
+
+          # x86/64 default packages ship the vendor rtl8152 driver, which
+          # conflicts with the mainline kmod-usb-net-rtl8152 from GENERAL.txt
+          # (both provide r8152.ko) -- drop the vendor default in favor of
+          # mainline. No-op on targets whose defaults don't include it.
+          if grep -q '^kmod-usb-net-rtl8152$' /tmp/pkgs.txt; then
+            echo "-kmod-usb-net-rtl8152-vendor" >> /tmp/pkgs.txt
+          fi
+
+          # WRT_PACKAGE dispatch input (newline/space separated), strip CONFIG_PACKAGE_ / =y
+          if [ -n "$WRT_PACKAGE" ]; then
+            echo -e "$WRT_PACKAGE" | sed -E 's/CONFIG_PACKAGE_//g; s/=y//g' | tr ' ' '\n' >> /tmp/pkgs.txt
+          fi
+
+          # sing-box: installed from the local prebuilt feed (also pulled as a
+          # momo dependency, but list it so the SagerNet build is guaranteed in).
+          echo "sing-box" >> /tmp/pkgs.txt
+
+          PKGS=$(grep -vE '^\s*$' /tmp/pkgs.txt | sort -u | tr '\n' ' ')
+          echo "WRT_PKGS=$PKGS" >> $GITHUB_ENV
+          echo "=== packages ==="; echo "$PKGS"
+
+      - name: Prepare Files Overlay
+        run: |
+          FILES="ib/files"
+          mkdir -p "$FILES/etc/uci-defaults"
+
+          # first-boot settings (replaces settings.sh sed-on-source: IP/hostname/wifi)
+          cat > "$FILES/etc/uci-defaults/99-custom-settings" <<EOF
+          #!/bin/sh
+          uci -q batch <<-UCI
+            set system.@system[0].hostname='$WRT_NAME'
+            set network.lan.ipaddr='$WRT_IP'
+          UCI
+          for dev in \$(uci -q show wireless | grep -oE 'wireless\.[^.]+=wifi-iface' | cut -d. -f2 | cut -d= -f1); do
+            uci -q set wireless.\$dev.ssid='$WRT_SSID'
+            uci -q set wireless.\$dev.key='$WRT_NETPW'
+            uci -q set wireless.\$dev.encryption='psk2'
+          done
+          uci -q commit
+          exit 0
+          EOF
+          chmod +x "$FILES/etc/uci-defaults/99-custom-settings"
+          echo "files overlay ready"
+
+      - name: Build Images
+        run: |
+          cd ib
+          mkdir -p "$GITHUB_WORKSPACE/upload"
+
+          # per-device profiles selected in this target's config
+          PROFILES=$(grep -oP "DEVICE_${WRT_TARGET//\//_}_DEVICE_\K[^=]+" \
+            "$GITHUB_WORKSPACE/config/$WRT_CONFIG.txt" | sort -u)
+          # fall back to the single "generic" profile if a target lists no
+          # per-DEVICE lines (x86_64 has none; its only profile is "generic").
+          [ -z "$PROFILES" ] && PROFILES="generic"
+
+          # honor CONFIG_TARGET_ROOTFS_PARTSIZE from the target config
+          # (ImageBuilder supports overriding via the ROOTFS_PARTSIZE make var)
+          PARTSIZE=$(grep -oP '^CONFIG_TARGET_ROOTFS_PARTSIZE=\K\d+' \
+            "$GITHUB_WORKSPACE/config/$WRT_CONFIG.txt" || true)
+
+          # One upstream-broken image recipe must not sink the other profiles
+          # (e.g. netgear_wax220 factory.img breaks inside ImageBuilder while
+          # building fine on the official buildbot): warn, skip, keep going.
+          echo "profiles: $PROFILES"
+          FAILED=""
+          for P in $PROFILES; do
+            echo "::group::build $P"
+            make image PROFILE="$P" PACKAGES="$WRT_PKGS" FILES="files" ${PARTSIZE:+ROOTFS_PARTSIZE="$PARTSIZE"} \
+              || make image PROFILE="$P" PACKAGES="$WRT_PKGS" FILES="files" ${PARTSIZE:+ROOTFS_PARTSIZE="$PARTSIZE"} V=s \
+              || { echo "::warning::profile $P failed, skipping"; FAILED="$FAILED $P"; }
+            echo "::endgroup::"
+          done
+          if [ -n "$FAILED" ]; then
+            echo "### Failed profiles" >> $GITHUB_STEP_SUMMARY
+            for P in $FAILED; do echo "- $P" >> $GITHUB_STEP_SUMMARY; done
+          fi
+
+          # collect outputs
+          find bin/targets/ -type f \( -name "*.bin" -o -name "*.img.gz" -o -name "*.vmdk" -o -name "*.qcow2" -o -name "*.vdi" -o -name "*.vhdx" -o -name "*.iso" -o -name "*.itb" -o -name "*sysupgrade*" -o -name "*factory*" -o -name "*.manifest" \) \
+            -exec cp -f {} "$GITHUB_WORKSPACE/upload/" \;
+          ls -la "$GITHUB_WORKSPACE/upload/"
+          [ -n "$(ls -A "$GITHUB_WORKSPACE/upload/")" ] || { echo "::error::no images produced at all"; exit 1; }
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{env.WRT_CONFIG}}
+          files: ./upload/*.*
+          body: |
+            Platform: ${{env.WRT_CONFIG}} (${{env.WRT_TARGET}})
+            Built with ImmortalWRT snapshot ImageBuilder
+            Date: ${{env.WRT_DATE}}

@@ -1,0 +1,16 @@
+# Third-party apk feeds baked into the firmware for on-device `apk update`,
+# and (for ImageBuilder targets) also used at build time to install packages.
+#
+# One feed per line:   name|url[|pubkey_url]
+#   name       short id, used as the key filename (/etc/apk/keys/<name>.pem)
+#   url        apk repo dir that contains packages.adb
+#   pubkey_url (optional) URL of the feed signing key
+#
+# {arch} is substituted with the target apk arch (x86_64, aarch64_cortex-a53).
+# Lines starting with # and blank lines are ignored.
+#
+# UPDATE_VERSION-style needs go here too: ImageBuilder/source builds never
+# compile these from source, so to ship a newer/custom build you point at a
+# feed that already hosts the prebuilt apk.
+
+momo|https://momomomo.pages.dev/SNAPSHOT/{arch}/momo|https://momomomo.pages.dev/public-key.pem
