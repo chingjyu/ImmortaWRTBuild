@@ -30,6 +30,10 @@ env:
   # Packages present in GENERAL/<TARGET> config but absent from the official
   # apk feed (they only exist in the buildroot source tree). Skipped for IB.
   IB_IGNORE: "cpufreq nand-utils kmod-mtd-rw"
+  # The current snapshot target feed still contains mtd and block-mount built
+  # against the retired 20260721 libubox ABI. Keep the ImageBuilder usable
+  # while the upstream snapshot feeds are rebuilt.
+  IB_SNAPSHOT_EXCLUDES: "-automount -mtd"
 
 jobs:
   imagebuilder:
@@ -108,8 +112,9 @@ jobs:
         run: |
           cd ib
           # sing-box: SagerNet ships prebuilt OpenWrt apks (no packages.adb feed),
-          # so drop the arch-matched latest apk into the local packages/ feed and
-          # let `make package_index` index it for install into the image.
+          # so drop the arch-matched latest apk into the local packages/ feed.
+          # `make image` creates its signing key before generating packages.adb;
+          # indexing here fails because that key does not exist yet.
           SB_VER=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
             https://api.github.com/repos/SagerNet/sing-box/releases/latest \
             | grep -oP '"tag_name":\s*"v?\K[^"]+')
@@ -118,7 +123,6 @@ jobs:
           SB_NAME=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*name:\s*\K\S+')
           SB_PKGVER=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*version:\s*\K\S+')
           mv /tmp/sing-box.apk "packages/${SB_NAME}-${SB_PKGVER}.apk"
-          make package_index
           echo "added to local feed: ${SB_NAME}-${SB_PKGVER}.apk"
 
       - name: Compute Package List
@@ -152,6 +156,11 @@ jobs:
           # sing-box: installed from the local prebuilt feed (also pulled as a
           # momo dependency, but list it so the SagerNet build is guaranteed in).
           echo "sing-box" >> /tmp/pkgs.txt
+
+          # Temporary ImmortalWRT snapshot ABI workaround. The exclusions use
+          # ImageBuilder's normal package-removal syntax, so they also remove
+          # the target defaults that currently depend on the retired ABI.
+          for P in $IB_SNAPSHOT_EXCLUDES; do echo "$P" >> /tmp/pkgs.txt; done
 
           PKGS=$(grep -vE '^\s*$' /tmp/pkgs.txt | sort -u | tr '\n' ' ')
           echo "WRT_PKGS=$PKGS" >> $GITHUB_ENV
@@ -221,7 +230,7 @@ jobs:
           [ -n "$(ls -A "$GITHUB_WORKSPACE/upload/")" ] || { echo "::error::no images produced at all"; exit 1; }
 
       - name: Release Firmware
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{env.WRT_CONFIG}}
           files: ./upload/*.*
