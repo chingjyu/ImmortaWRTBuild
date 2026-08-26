@@ -277,7 +277,7 @@ jobs:
           fi
 
       - name: Release Firmware
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{env.WRT_CONFIG}}
           files: ./wrt/upload/*.*
